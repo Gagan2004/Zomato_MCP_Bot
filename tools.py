@@ -14,9 +14,6 @@ async def list_tools():
     result = await session.list_tools()
     return result
 
-from langchain_core.tools import tool
-
-@tool
 async def search_restaurants(keyword: str, address_id: str, min_price: int = None, max_price: int = None, min_rating: float = None):
     """Search for restaurants based on a keyword and filters."""
     if not session: return "MCP Session not active"
@@ -33,14 +30,12 @@ async def search_restaurants(keyword: str, address_id: str, min_price: int = Non
     result = await session.call_tool("get_restaurants_for_keyword", args)
     return result.content[0].text
 
-@tool
 async def get_menu(res_id: int, address_id: str):
     """Get the menu listing for a restaurant."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("get_menu_items_listing", {"res_id": res_id, "address_id": address_id})
     return result.content[0].text
 
-@tool
 async def create_cart(res_id: int, address_id: str, items: list, payment_type: str = "upi_qr"):
     """Create a cart with the given items."""
     print(f"DEBUG: create_cart called with res_id={res_id}, address_id={address_id}, items={items}")
@@ -57,7 +52,6 @@ async def create_cart(res_id: int, address_id: str, items: list, payment_type: s
         print(f"DEBUG: create_cart failed: {e}")
         return f"Error creating cart: {e}"
 
-@tool
 async def checkout_cart(cart_id: str):
     """Checkout the cart."""
     print(f"DEBUG: checkout_cart called with cart_id={cart_id}")
@@ -72,18 +66,26 @@ async def checkout_cart(cart_id: str):
 # Global storage for auth flow (demo purpose)
 auth_packet_cache = {}
 
-@tool
 async def login_step_1(phone_number: str):
     """Initiate login with phone number."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("bind_user_number", {"phone_number": phone_number})
+    # The result usually contains the auth_packet string or object
+    # For this MCP, we might need to parse it, but for now let's store the raw text if it's a string,
+    # or rely on the user to provide the code.
+    # Actually, the tool output likely describes what to do.
+    # But for the next step, we need the auth_packet. 
+    # Let's assume the MCP implementation handles state or returns it.
+    # If it returns a JSON string, we might need to parse it.
     auth_packet_cache['last'] = result.content[0].text # simplified
     return result.content[0].text
 
-@tool
 async def login_step_2(code: str):
     """Verify login OTP."""
     if not session: return "MCP Session not active"
+    # We need the auth_packet from step 1. 
+    # In a real app, this would be cleaner.
+    # Here we'll pass the 'last' cached result as auth_packet.
     if 'last' not in auth_packet_cache:
         return "Please run login_step_1 first."
         
@@ -92,6 +94,9 @@ async def login_step_2(code: str):
         # Try to parse the last output as JSON if it's a structure
         auth_packet = json.loads(auth_packet_cache['last'])
     except:
+        # If not json, maybe it's just the object text? 
+        # For the Zomato MCP, the internal tool expects the exact object returned by bind.
+        # We will try passing the raw text or the parsed dict.
         auth_packet = auth_packet_cache['last']
 
     result = await session.call_tool("bind_user_number_verify_code", {
@@ -100,14 +105,12 @@ async def login_step_2(code: str):
     })
     return result.content[0].text
 
-@tool
 async def get_tracking_info():
     """Get current order tracking info."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("get_order_tracking_info", {})
     return result.content[0].text
 
-@tool
 async def get_saved_addresses():
     """Get user's saved addresses."""
     if not session: return "MCP Session not active"

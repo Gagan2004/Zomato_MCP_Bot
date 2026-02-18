@@ -3,5 +3,3 @@ python-telegram-bot
 python-dotenv
 nest_asyncio
 mcp
-langchain
-langchain-google-genai

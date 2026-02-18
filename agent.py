@@ -1,9 +1,11 @@
 import os
-import itertools
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate
+import google.generativeai as genai
+from google.ai.generativelanguage_v1beta.types import content
+from config import GEMINI_API_KEY
 from tools import search_restaurants, get_menu, create_cart, get_tracking_info, get_saved_addresses, checkout_cart, login_step_1, login_step_2
+import traceback
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Define the tools available to the model
 tools = [
@@ -49,71 +51,108 @@ To place an order ("Add to cart"), you **MUST** have the following information. 
 7.  **Checkout**: Use `create_cart` then `checkout_cart`.
 """
 
+
 apis = {
-    "1": os.getenv('GEMINI_API_KEY'),
+    "1": "[REDACTED_API_KEY]",
+   
 }
 
+
+model = genai.GenerativeModel(
+    model_name="gemini-2.5-flash",
+    tools=tools,
+    system_instruction=SYSTEM_INSTRUCTION
+)
+
+import itertools
 api_cycle = itertools.cycle(apis.values())
 
 class Agent:
     def __init__(self):
-        # We will initialize the agent executor lazily or rebuild it on each turn if we want to rotate keys strictly per message,
-        # but LangChain Client init is usually heavy.
-        # A better approach for key rotation in LangChain is to just rotate the model instance or key.
-        # For simplicity, we'll store the tools and prompt here.
-        self.tools = tools
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_INSTRUCTION),
-            ("placeholder", "{chat_history}"),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-        # We need to maintain memory manually or use LangChain's memory.
-        # For this refactor, let's keep it simple and stateless (or pass history from main.py if we were using it).
-        # But wait, the previous `agent.py` was managing `self.chat` which implies session state.
-        # `main.py` creates a new Agent instance per User ID.
-        # So we should maintain history here.
-        from langchain_core.messages import SystemMessage
-        from langchain.memory import ConversationBufferMemory
-        
-        # We'll use a simple list for history to pass to the agent
-        self.chat_history = [] 
+        # Disable automatic function calling so we can handle async tools manually
+        self.chat = model.start_chat(enable_automatic_function_calling=False)
+        self.tools_map = {t.__name__: t for t in tools}
 
     async def process_message(self, user_message: str):
         """
-        Process a user message and return the response using LangChain.
+        Process a user message and return the response, handling tool calls manually.
         """
         try:
             # Rotate API Key
             next_key = next(api_cycle)
             print(f"DEBUG: Using API Key ending in ...{next_key[-4:]}")
-            
-            # Initialize Model with new key
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
-                google_api_key=next_key,
-                temperature=0
-            )
-            
-            # Create Agent
-            agent = create_tool_calling_agent(llm, self.tools, self.prompt)
-            agent_executor = AgentExecutor(agent=agent, tools=self.tools, verbose=True)
-            
-            # Use the executor
-            # Note: We are passing chat_history manually.
-            response = await agent_executor.ainvoke({
-                "input": user_message,
-                "chat_history": self.chat_history
-            })
-            
-            # Update history
-            from langchain_core.messages import HumanMessage, AIMessage
-            self.chat_history.append(HumanMessage(content=user_message))
-            self.chat_history.append(AIMessage(content=response["output"]))
-            
-            return response["output"]
+            genai.configure(api_key=next_key)
 
+            # Send initial message
+            response = await self.chat.send_message_async(user_message)
+            
+            # Loop to handle function calls if any
+            # We check if the response contains function calls
+            # The simplified check is to look at parts
+            while response.parts and any(part.function_call for part in response.parts):
+                
+                # Prepare parts for the next request (outputs)
+                next_parts = []
+                
+                for part in response.parts:
+                    if part.function_call:
+                        fn_name = part.function_call.name
+                        fn_args = dict(part.function_call.args)
+                        
+                        # print(f"Calling tool: {fn_name} with {fn_args}") # Debug
+                        
+                        # Helper to recursively convert proto types to dict/list
+                        def to_native(obj):
+                            try:
+                                # Check if it's a MapComposite (dict-like) - Check this FIRST
+                                if hasattr(obj, 'items'):
+                                    return {k: to_native(v) for k, v in obj.items()}
+                                # Check if it's a RepeatedComposite (list-like)
+                                elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes, dict)):
+                                    return [to_native(i) for i in obj]
+                                else:
+                                    return obj
+                            except:
+                                return obj
+
+                        # Convert arguments to native python types
+                        native_fn_args = {k: to_native(v) for k, v in fn_args.items()}
+
+                        result_content = {}
+                        if fn_name in self.tools_map:
+                            tool_func = self.tools_map[fn_name]
+                            try:
+                                # Await the async tool function
+                                # print(f"Executing {fn_name}...")
+                                tool_result = await tool_func(**native_fn_args)
+                                result_content = {"result": tool_result}
+                            except Exception as e:
+                                result_content = {"error": str(e)}
+                        else:
+                            result_content = {"error": f"Tool {fn_name} not found."}
+                        
+                        # Create the FunctionResponse part
+                        # We use the raw dictionary format which the SDK accepts for 'parts'
+                        # or specifically construct the protobuf object if needed.
+                        # The SDK `send_message` usually accepts a list of Parts.
+                        
+                        next_parts.append(
+                            content.Part(
+                                function_response=content.FunctionResponse(
+                                    name=fn_name,
+                                    response=result_content
+                                )
+                            )
+                        )
+                
+                # If we collected function responses, send them back to the model
+                if next_parts:
+                    response = await self.chat.send_message_async(next_parts)
+                else:
+                    # Should not happen if loop condition met, but break just in case
+                    break
+            
+            return response.text
         except Exception as e:
-            # traceback.print_exc()
-            print(f"Error processing message: {e}")
+            traceback.print_exc()
             return f"Error processing message: {str(e)}"
