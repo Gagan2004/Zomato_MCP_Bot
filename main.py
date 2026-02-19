@@ -36,7 +36,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     response = await agent.process_message(user_message)
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=response)
+
+    # Telegram message limit is 4096. To be safe, chunk at 4000.
+    if len(response) > 4000:
+        for i in range(0, len(response), 4000):
+            chunk = response[i:i+4000]
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk)
+    else:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=response)
 
 async def main():
     if not TELEGRAM_TOKEN:

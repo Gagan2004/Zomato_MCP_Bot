@@ -2,6 +2,7 @@ import os
 import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from langchain_core.tools import tool
 from config import ZOMATO_MCP_COMMAND, ZOMATO_MCP_ARGS
 
 # Global session for simplicity in this demo
@@ -14,11 +15,29 @@ async def list_tools():
     result = await session.list_tools()
     return result
 
-async def search_restaurants(keyword: str, address_id: str, min_price: int = None, max_price: int = None, min_rating: float = None):
-    """Search for restaurants based on a keyword and filters."""
+@tool
+async def search_restaurants(keyword: str, address_id: str, limit: int = 20, min_price: int = None, max_price: int = None, min_rating: float = None, postback_params: str = None):
+    """Search for restaurants. Default limit is 20. Pass postback_params to fetch next page."""
     if not session: return "MCP Session not active"
     
-    args = {"keyword": keyword, "address_id": address_id}
+    args = {"keyword": keyword, "address_id": address_id, "page_size": limit}
+    # Handle postback_params for pagination
+    if postback_params:
+        import json
+        try:
+            # If formatted as a stringified dict/json, parse it or pass as is depending on what MCP expects.
+            # The MCP schema says it's an object with $ref, but implies it can be passed.
+            # Let's assume the MCP tool accepts it as a raw dict or string.
+            # Based on inspection, it's a "SearchPostbackParams" object.
+            # if the input is a string, we might need to load it.
+            if isinstance(postback_params, str):
+                 params_dict = json.loads(postback_params)
+                 args["postback_params"] = params_dict
+            else:
+                 args["postback_params"] = postback_params
+        except Exception as e:
+            print(f"DEBUG: Error processing postback_params: {e}")
+
     menu_filter = {}
     if min_price: menu_filter["min_price"] = min_price
     if max_price: menu_filter["max_price"] = max_price
@@ -28,14 +47,88 @@ async def search_restaurants(keyword: str, address_id: str, min_price: int = Non
         args["filter"] = menu_filter
         
     result = await session.call_tool("get_restaurants_for_keyword", args)
-    return result.content[0].text
+    
+    # Debug: Check returned data
+    # Parse and format the output
+    import json
+    content = result.content[0].text
+    try:
+        data = json.loads(content)
+        items = []
+        
+        # Extract postback_params for the next page
+        next_postback = data.get("postback_params")
+        # specific to Zomato structure, sometimes it's nested
+        
+        if isinstance(data, list):
+            items = data
+            print(f"DEBUG: Data is a list of {len(items)} items")
+        elif isinstance(data, dict):
+             # Try common structure
+             # Zomato sometimes puts promoted stats in 'restaurants' and organic in 'sections'
+             # We should grab BOTH.
+             
+             # 1. Check 'restaurants'
+             direct_items = data.get("restaurants", [])
+             if direct_items:
+                 print(f"DEBUG: Found {len(direct_items)} items in 'restaurants'")
+                 items.extend(direct_items)
+                 
+             # 2. Check 'sections' -> 'SECTION_SEARCH_RESULT'
+             sections = data.get("sections", {})
+             if sections:
+                 search_results = sections.get("SECTION_SEARCH_RESULT", [])
+                 if search_results:
+                     print(f"DEBUG: Found {len(search_results)} items in SECTION_SEARCH_RESULT")
+                     items.extend(search_results)
+             
+             # Deduplicate by res_id to be safe
+             seen_ids = set()
+             unique_items = []
+             for item in items:
+                 info = item.get("info", item)
+                 rid = info.get("res_id")
+                 if rid and rid not in seen_ids:
+                     seen_ids.add(rid)
+                     unique_items.append(item)
+             
+             items = unique_items
+        
+        # If we have a list of items, format them nicely to ensure LLM sees all of them
+        if items and isinstance(items, list):
+            print(f"DEBUG: Found {len(items)} items. Formatting...")
+            formatted_list = []
+            for item in items:
+                # Extract simplified info
+                info = item.get("info", item)
+                
+                name = info.get("name", "Unknown")
+                res_id = info.get("res_id", "N/A")
+                rating = info.get("rating", {}).get("aggregate_rating", "N/A")
+                if isinstance(info.get("rating"), str): rating = info.get("rating") 
+                
+                delivery_time = info.get("order", {}).get("delivery_time", "N/A")
+                formatted_list.append(f"- {name} (ID: {res_id}) | Rating: {rating} | Time: {delivery_time}")
+            
+            output_str = "\n".join(formatted_list)
+            if next_postback:
+                # Return the postback params as a JSON string so the LLM can use it
+                output_str += f"\n\n[Pagination] To see more results, call this tool again with postback_params='{json.dumps(next_postback)}'"
+            return output_str
+            
+    except Exception as e:
+        print(f"DEBUG: Error parsing/formatting: {e}")
+        
+    return content
 
+@tool
 async def get_menu(res_id: int, address_id: str):
     """Get the menu listing for a restaurant."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("get_menu_items_listing", {"res_id": res_id, "address_id": address_id})
     return result.content[0].text
 
+@tool
 async def create_cart(res_id: int, address_id: str, items: list, payment_type: str = "upi_qr"):
     """Create a cart with the given items."""
     print(f"DEBUG: create_cart called with res_id={res_id}, address_id={address_id}, items={items}")
@@ -52,6 +145,7 @@ async def create_cart(res_id: int, address_id: str, items: list, payment_type: s
         print(f"DEBUG: create_cart failed: {e}")
         return f"Error creating cart: {e}"
 
+@tool
 async def checkout_cart(cart_id: str):
     """Checkout the cart."""
     print(f"DEBUG: checkout_cart called with cart_id={cart_id}")
@@ -66,6 +160,7 @@ async def checkout_cart(cart_id: str):
 # Global storage for auth flow (demo purpose)
 auth_packet_cache = {}
 
+@tool
 async def login_step_1(phone_number: str):
     """Initiate login with phone number."""
     if not session: return "MCP Session not active"
@@ -80,6 +175,7 @@ async def login_step_1(phone_number: str):
     auth_packet_cache['last'] = result.content[0].text # simplified
     return result.content[0].text
 
+@tool
 async def login_step_2(code: str):
     """Verify login OTP."""
     if not session: return "MCP Session not active"
@@ -105,12 +201,14 @@ async def login_step_2(code: str):
     })
     return result.content[0].text
 
+@tool
 async def get_tracking_info():
     """Get current order tracking info."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("get_order_tracking_info", {})
     return result.content[0].text
 
+@tool
 async def get_saved_addresses():
     """Get user's saved addresses."""
     if not session: return "MCP Session not active"

@@ -3,3 +3,7 @@ python-telegram-bot
 python-dotenv
 nest_asyncio
 mcp
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-google-genai==1.0.10
+langchain-openai==0.1.23
