@@ -50,7 +50,12 @@ To place an order ("Add to cart"), you **MUST** have the following information. 
     - When showing menu, list top items with prices.
     - Before ordering, always show the estimated total and ask for confirmation.
 6.  **Confirm Orders**: When adding to cart, confirm the exact items and variants.
-7.  **Checkout**: Use `create_cart` then `checkout_cart`.
+7.  **Create Cart**: Call `create_cart` to add items. 
+    - **STOP HERE**. Do NOT call `checkout_cart` yet.
+    - Show the user the cart details and total amount returned by `create_cart`.
+    - Ask: "Do you want to proceed to checkout?"
+8.  **Checkout**: ONLY after the user says "Yes" or "Checkout", call `checkout_cart`.
+8.  **QR Code**: If `checkout_cart` returns a message containing "[QR Code Image Saved to ...]", you **MUST** repeat that exact string in your final response to the user. Do not rephrase it. This is required for the system to send the image.
 """
 
 

@@ -1,9 +1,12 @@
+import json
 import os
 import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from langchain_core.tools import tool
 from config import ZOMATO_MCP_COMMAND, ZOMATO_MCP_ARGS
+from user_context import current_user_id
+import database
 
 # Global session for simplicity in this demo
 session = None
@@ -50,7 +53,6 @@ async def search_restaurants(keyword: str, address_id: str, limit: int = 20, min
     
     # Debug: Check returned data
     # Parse and format the output
-    import json
     content = result.content[0].text
     try:
         data = json.loads(content)
@@ -134,13 +136,44 @@ async def create_cart(res_id: int, address_id: str, items: list, payment_type: s
     print(f"DEBUG: create_cart called with res_id={res_id}, address_id={address_id}, items={items}")
     if not session: return "MCP Session not active"
     try:
-        result = await session.call_tool("create_cart", {
+        if items:
+            for item in items:
+                # Zomato requires 'variant_id' to be present.
+                # If the LLM passed 'id' which looks like a variant id (starts with v_), use it.
+                if "variant_id" not in item and "id" in item:
+                    if str(item["id"]).startswith("v_"):
+                         item["variant_id"] = item["id"]
+                    # If it starts with ctl_, it is a dish id, not variant. 
+                    # But if we don't have variant_id, the API fails.
+                    # We will try to rely on the LLM filtering, but let's at least not send malformed dicts.
+                    
+        cart_args = {
             "res_id": res_id, 
             "address_id": address_id, 
             "items": items,
             "payment_type": payment_type
-        })
-        return result.content[0].text
+        }
+        import json
+        print(f"DEBUG: calling create_cart with: {json.dumps(cart_args, indent=2)}")
+        result = await session.call_tool("create_cart", cart_args)
+        
+        content = result.content[0].text
+        # Try to parse cart_id
+        try:
+             import json
+             # Zomato usually returns a Cart object which has an 'id'
+             cart_data = json.loads(content)
+             cart_id = cart_data.get("id") or cart_data.get("cart_id")
+             if cart_id:
+                  uid = current_user_id.get()
+                  if uid:
+                      database.log_cart_creation(uid, cart_id, res_id, items)
+                      print(f"DEBUG: Logged cart {cart_id} for user {uid}")
+        except Exception as db_e:
+             # Handle non-string content gracefully
+             print(f"DEBUG: Failed to log cart to DB. Full content: {content}. Error: {db_e}")
+             
+        return content
     except Exception as e:
         print(f"DEBUG: create_cart failed: {e}")
         return f"Error creating cart: {e}"
@@ -152,7 +185,56 @@ async def checkout_cart(cart_id: str):
     if not session: return "MCP Session not active"
     try:
         result = await session.call_tool("checkout_cart", {"cart_id": cart_id})
-        return result.content[0].text
+        
+        # Log successful checkout
+        try:
+             # If checkout doesn't raise exception, assume success or read status
+             # Logic refinement: If we get a QR code, it means payment is PENDING.
+             # "Completed" should probably be reserved for when we track it and it says confirmed.
+             database.update_order_status(cart_id, "pending_payment")
+             print(f"DEBUG: Updated order status for {cart_id} to pending_payment")
+        except Exception as db_e:
+             print(f"DEBUG: Failed to update order status: {db_e}")
+
+        outputs = []
+        for content in result.content:
+            if hasattr(content, 'text'):
+                outputs.append(content.text)
+            elif hasattr(content, 'image'):
+                # Save the image to a file so we can view/send it
+                try:
+                    print("DEBUG: Image content found in checkout response.")
+                    import base64
+                    img_data = base64.b64decode(content.data)
+                    filename = f"qrcodes/checkout_{cart_id}.png"
+                    os.makedirs("qrcodes", exist_ok=True)
+                    with open(filename, "wb") as f:
+                        f.write(img_data)
+                    print(f"DEBUG: Saved QR code to {filename}")
+                    outputs.append(f"[QR Code Image Saved to {filename}]")
+                    # In a real bot, we'd send this file back. 
+                    # For local testing, knowing the path is enough.
+                except Exception as img_e:
+                    print(f"DEBUG: Failed to save QR image: {img_e}")
+                    outputs.append("[QR Code Image Received but failed to save]")
+                    
+            elif hasattr(content, 'data'): # ImageContent has .data (base64)
+                 try:
+                    import base64
+                    img_data = base64.b64decode(content.data)
+                    filename = f"qrcodes/checkout_{cart_id}.png"
+                    os.makedirs("qrcodes", exist_ok=True)
+                    with open(filename, "wb") as f:
+                        f.write(img_data)
+                    print(f"DEBUG: Saved QR code to {filename}")
+                    outputs.append(f"[QR Code Image Saved to {filename}]")
+                 except Exception as img_e:
+                     print(f"DEBUG: Failed to save QR image: {img_e}")
+                     outputs.append("[QR Code Image Received but failed to save]")
+            else:
+                 outputs.append(str(content))
+                 
+        return "\n".join(outputs)
     except Exception as e:
         print(f"DEBUG: checkout_cart failed: {e}")
         return f"Error checking out cart: {e}"
@@ -206,7 +288,31 @@ async def get_tracking_info():
     """Get current order tracking info."""
     if not session: return "MCP Session not active"
     result = await session.call_tool("get_order_tracking_info", {})
-    return result.content[0].text
+    
+    content = result.content[0].text
+    # Parse info to update DB if possible
+    try:
+        import json
+        tracking_data = json.loads(content)
+        if isinstance(tracking_data, list):
+             for order in tracking_data:
+                 # Extract status from order structure
+                 # Structure varies, looking for common keys
+                 status = "unknown"
+                 # Example: order -> order_status or similar
+                 if "order_status" in order: status = order["order_status"]
+                 elif "status" in order: status = order["status"]
+                 
+                 # Also try to find cart_id/order_id to link
+                 cart_id = order.get("cart_id") or order.get("order_id") # Zomato uses order_id usually after checkout
+                 
+                 if cart_id and status != "unknown":
+                      database.update_order_status(str(cart_id), status)
+                      
+    except Exception as e:
+        print(f"DEBUG: Failed to sync tracking status to DB: {e}")
+        
+    return content
 
 @tool
 async def get_saved_addresses():
